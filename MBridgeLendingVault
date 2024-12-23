@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract MBridgeLendingVault is ReentrancyGuard, Ownable {
+    IERC20 public immutable mBridgeToken;
+    IERC20 public immutable wbtcToken;
+    
+    // Struct to track user deposits and borrows
+    struct UserAccount {
+        uint256 collateralAmount;
+        uint256 borrowedAmount;
+    }
+    
+    // Lending pool parameters
+    uint256 public constant COLLATERAL_RATIO = 150; // 150% collateralization required
+    uint256 public constant LIQUIDATION_THRESHOLD = 130; // 130% liquidation threshold
+    uint256 public constant PLATFORM_FEE = 1; // 1% fee
+    
+    // User balances mapping
+    mapping(address => UserAccount) public userAccounts;
+    
+    // Events
+    event Deposit(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
+    event Borrow(address indexed user, uint256 amount);
+    event Repay(address indexed user, uint256 amount);
+    event Liquidated(address indexed user, address indexed liquidator, uint256 amount);
+    
+    constructor(address _mBridgeToken, address _wbtcToken) {
+        mBridgeToken = IERC20(_mBridgeToken);
+        wbtcToken = IERC20(_wbtcToken);
+    }
+    
+    // Calculate maximum borrowable amount based on collateral
+    function getMaxBorrowAmount(uint256 collateralAmount) public pure returns (uint256) {
+        return (collateralAmount * 100) / COLLATERAL_RATIO;
+    }
+    
+    // Deposit mBridge tokens as collateral
+    function depositCollateral(uint256 amount) external nonReentrant {
+        require(amount > 0, "Amount must be greater than 0");
+        require(mBridgeToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        
+        userAccounts[msg.sender].collateralAmount += amount;
+        emit Deposit(msg.sender, amount);
+    }
+    
+    // Withdraw collateral if not needed for outstanding loans
+    function withdrawCollateral(uint256 amount) external nonReentrant {
+        UserAccount storage account = userAccounts[msg.sender];
+        require(amount > 0, "Amount must be greater than 0");
+        require(amount <= account.collateralAmount, "Insufficient collateral");
+        
+        // Check if remaining collateral maintains required ratio
+        uint256 remainingCollateral = account.collateralAmount - amount;
+        require(remainingCollateral * 100 >= account.borrowedAmount * COLLATERAL_RATIO, 
+                "Withdrawal would break collateral ratio");
+        
+        account.collateralAmount -= amount;
+        require(mBridgeToken.transfer(msg.sender, amount), "Transfer failed");
+        emit Withdraw(msg.sender, amount);
+    }
+    
+    // Borrow WBTC against deposited collateral
+    function borrow(uint256 amount) external nonReentrant {
+        require(amount > 0, "Amount must be greater than 0");
+        UserAccount storage account = userAccounts[msg.sender];
+        
+        uint256 maxBorrow = getMaxBorrowAmount(account.collateralAmount);
+        require(account.borrowedAmount + amount <= maxBorrow, "Would exceed allowed borrow amount");
+        
+        account.borrowedAmount += amount;
+        require(wbtcToken.transfer(msg.sender, amount), "Transfer failed");
+        emit Borrow(msg.sender, amount);
+    }
+    
+    // Repay borrowed WBTC
+    function repay(uint256 amount) external nonReentrant {
+        require(amount > 0, "Amount must be greater than 0");
+        UserAccount storage account = userAccounts[msg.sender];
+        require(amount <= account.borrowedAmount, "Amount exceeds debt");
+        
+        require(wbtcToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        account.borrowedAmount -= amount;
+        emit Repay(msg.sender, amount);
+    }
+    
+    // Liquidate undercollateralized positions
+    function liquidate(address user) external nonReentrant {
+        UserAccount storage account = userAccounts[user];
+        require(account.borrowedAmount > 0, "No debt to liquidate");
+        
+        uint256 collateralValue = account.collateralAmount;
+        uint256 debtValue = account.borrowedAmount;
+        
+        require(collateralValue * 100 < debtValue * LIQUIDATION_THRESHOLD, 
+                "Position not liquidatable");
+        
+        // Calculate liquidation amounts
+        uint256 repayAmount = account.borrowedAmount;
+        uint256 collateralToLiquidator = account.collateralAmount;
+        
+        // Clear user's position
+        account.borrowedAmount = 0;
+        account.collateralAmount = 0;
+        
+        // Transfer assets
+        require(wbtcToken.transferFrom(msg.sender, address(this), repayAmount), 
+                "Repayment transfer failed");
+        require(mBridgeToken.transfer(msg.sender, collateralToLiquidator), 
+                "Collateral transfer failed");
+        
+        emit Liquidated(user, msg.sender, repayAmount);
+    }
+}
